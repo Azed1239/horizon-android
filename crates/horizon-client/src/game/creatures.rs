@@ -2538,7 +2538,8 @@ impl Game<'_> {
                     mob,
                     distance,
                     modifier,
-                } => self.fall_to_passengers(mob, distance, modifier),
+                    source,
+                } => self.fall_to_passengers(mob, distance, modifier, source),
                 MobEvent::ShedScute { mob, at, pitch } => {
                     // The mob already checked `shouldDropLoot` (a baby, `mob_drops`).
                     let table = "minecraft:gameplay/armadillo_shed";

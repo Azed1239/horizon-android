@@ -1832,6 +1832,7 @@ pub enum MobEvent {
         mob: u32,
         distance: f64,
         modifier: f32,
+        source: DamageKind,
     },
 }
 /// How a spawned-by-kind mob should be set up.

@@ -894,11 +894,22 @@ impl Mob {
             self.position.z.floor() as i32,
         ]
     }
-    /// The landing of `check_fall_damage`: the whole fall, with no block
-    /// softening it.
+    /// `PointedDripstoneBlock.fallOn`: an upward tip adds 2.5 blocks and
+    /// doubles the fall damage, retaining the stalagmite source for riders.
     fn cause_fall_damage(&mut self, w: &MobWorld, events: &mut Vec<MobEvent>) {
         let pos = self.block_on_legacy(w);
-        self.cause_fall_damage_at(self.fall_distance, 1.0, events, Some((w, pos)));
+        let state = w.registry.state(w.world.block(pos[0], pos[1], pos[2]));
+        let tip = state.is_some_and(|s| {
+            s.name == "minecraft:pointed_dripstone"
+                && s.properties.get("vertical_direction").map(String::as_str) == Some("up")
+                && s.properties.get("thickness").map(String::as_str) == Some("tip")
+        });
+        let (distance, modifier, source) = if tip {
+            (self.fall_distance + 2.5, 2.0, super::DamageKind::Stalagmite)
+        } else {
+            (self.fall_distance, 1.0, super::DamageKind::Fall)
+        };
+        self.cause_fall_damage_at(distance, modifier, source, events, Some((w, pos)));
     }
     fn mod_block_fall(
         &self,
@@ -929,14 +940,16 @@ impl Mob {
         &mut self,
         distance: f64,
         modifier: f32,
+        source: super::DamageKind,
         events: &mut Vec<MobEvent>,
     ) {
-        self.cause_fall_damage_at(distance, modifier, events, None);
+        self.cause_fall_damage_at(distance, modifier, source, events, None);
     }
     fn cause_fall_damage_at(
         &mut self,
         distance: f64,
         modifier: f32,
+        source: super::DamageKind,
         events: &mut Vec<MobEvent>,
         contact: Option<(&MobWorld, [i32; 3])>,
     ) {
@@ -984,7 +997,7 @@ impl Mob {
         let damage = f64::from(self.mod_block_fall(contact, distance, damage as f32));
         // LivingEntity.causeFallDamage lets the riders fall first.
         if !horse {
-            self.fall_to_passengers(distance, modifier, events);
+            self.fall_to_passengers(distance, modifier, source, events);
         }
         if damage > 0.0 {
             // Llama.causeFallDamage: only a fall of six blocks or more hurts the
@@ -1005,21 +1018,28 @@ impl Mob {
             if !horse {
                 events.push(MobEvent::Sound(sound, at, 1.0, 1.0));
             }
-            self.damage(damage as f32, super::Damage::fall());
+            self.damage(damage as f32, super::Damage::of(source));
             if horse {
-                self.fall_to_passengers(distance, modifier, events);
+                self.fall_to_passengers(distance, modifier, source, events);
             }
         }
     }
     /// `Entity.propagateFallToPassengers`: the game gives the fall to each
     /// passenger (`causeFallDamage`), a mob or a player, for this mob is
     /// borrowed here.
-    fn fall_to_passengers(&self, distance: f64, modifier: f32, events: &mut Vec<MobEvent>) {
+    fn fall_to_passengers(
+        &self,
+        distance: f64,
+        modifier: f32,
+        source: super::DamageKind,
+        events: &mut Vec<MobEvent>,
+    ) {
         if self.rider.is_some() || self.extra.rider.is_some() {
             events.push(MobEvent::FallToPassengers {
                 mob: self.id,
                 distance,
                 modifier,
+                source,
             });
         }
     }
@@ -1635,6 +1655,101 @@ mod tests {
     /// up, landing on stone stops it dead.
     #[test]
     fn a_mob_bounces_off_a_bouncy_block_and_not_off_stone() {
+        landing_worlds(|w, types, floor| {
+            let ground = w.registry.state(floor).unwrap().name.as_str();
+            if !matches!(ground, "minecraft:slime_block" | "minecraft:stone") {
+                return;
+            }
+            let kind = std::sync::Arc::new(types.types["minecraft:pig"].clone());
+            let mut m = Mob::new(1, kind, Vec3::new(0.5, 1.0, 0.5), 0.0);
+            m.velocity = Vec3::new(0.0, -1.0, 0.0);
+            m.do_move(w, &mut Vec::new());
+            assert!(m.vertical_collision_below, "{ground}: the pig lands");
+            assert_eq!(
+                m.velocity.y > 0.0,
+                ground == "minecraft:slime_block",
+                "{ground}"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "requires prepared resources and tools/test_mob_dripstone_parity.py"]
+    fn dripstone_landings_match_vanilla() {
+        let path = std::env::var("HORIZON_MOB_DRIPSTONE_ORACLE").expect("run the parity harness");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut checked = 0;
+        landing_worlds(|w, types, floor| {
+            for row in rows
+                .iter()
+                .filter(|row| row["state"].as_u64() == Some(u64::from(floor.0)))
+            {
+                let mut kind = types.types["minecraft:pig"].clone();
+                kind.flags.fall_immune = row["immune"].as_bool().unwrap();
+                let mut m = Mob::new(1, std::sync::Arc::new(kind), Vec3::new(0.5, 1.0, 0.5), 0.0);
+                m.extra.rider = Some(2);
+                m.fall_distance = row["distance"].as_f64().unwrap();
+                let mut events = Vec::new();
+                m.cause_fall_damage(w, &mut events);
+                let damage = row["damage"].as_f64().unwrap() as f32;
+                assert_eq!(m.last_hurt, damage, "{row}");
+                let source = match row["source"].as_str().unwrap() {
+                    "stalagmite" => Some(super::super::DamageKind::Stalagmite),
+                    "fall" => Some(super::super::DamageKind::Fall),
+                    "none" => None,
+                    _ => panic!("unexpected oracle source"),
+                };
+                if damage > 0.0 {
+                    assert_eq!(m.last_damage.unwrap().0.kind, source.unwrap(), "{row}");
+                } else {
+                    assert!(m.last_damage.is_none(), "{row}");
+                }
+                let falls: Vec<_> = events
+                    .iter()
+                    .filter_map(|e| match e {
+                        MobEvent::FallToPassengers {
+                            distance,
+                            modifier,
+                            source,
+                            ..
+                        } => Some((*distance, *modifier, *source)),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(source) = source {
+                    let distance = row["passenger_distance"].as_f64().unwrap();
+                    let modifier = row["passenger_multiplier"].as_f64().unwrap() as f32;
+                    assert_eq!(falls, [(distance, modifier, source)], "{row}");
+                    // A mob rider receives that source without a second tip adjustment.
+                    let mut rider = Mob::new(
+                        2,
+                        std::sync::Arc::new(types.types["minecraft:pig"].clone()),
+                        Vec3::new(0.0, 0.0, 0.0),
+                        0.0,
+                    );
+                    rider.cause_fall_damage_from(distance, modifier, source, &mut Vec::new());
+                    assert_eq!(rider.last_hurt, damage, "{row}");
+                    if damage > 0.0 {
+                        assert_eq!(rider.last_damage.unwrap().0.kind, source, "{row}");
+                    }
+                } else {
+                    assert!(
+                        falls.is_empty(),
+                        "immune mob must not propagate a fall: {row}"
+                    );
+                }
+                checked += 1;
+            }
+        });
+        assert_eq!(checked, rows.len());
+        assert_eq!(
+            checked, 320,
+            "all 20 states, 8 distances, and both immunity flags"
+        );
+    }
+
+    fn landing_worlds(mut visit: impl FnMut(&MobWorld, &super::super::MobTypes, BlockStateId)) {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.local/horizon-client")
             .join(horizon_core::VANILLA_VERSION);
@@ -1659,14 +1774,20 @@ mod tests {
         .unwrap();
         let collision = crate::collisions::load(&root, registry).unwrap();
         let lid_openers = std::collections::HashMap::new();
-        for (ground, bounces) in [("minecraft:slime_block", true), ("minecraft:stone", false)] {
+        for index in 0..registry.len() {
+            let floor = BlockStateId(index as u32);
+            if !matches!(
+                registry.state(floor).unwrap().name.as_str(),
+                "minecraft:slime_block" | "minecraft:stone" | "minecraft:pointed_dripstone"
+            ) {
+                continue;
+            }
             let air = registry.default_state("minecraft:air").unwrap();
             let mut world = crate::world::World::new(air, 0);
             world.chunks.insert(
                 (0, 0),
                 std::sync::Arc::new(crate::chunk::Chunk::empty(0, 0)),
             );
-            let floor = registry.default_state(ground).unwrap();
             for x in 0..=1 {
                 for z in 0..=1 {
                     world.set(x, 0, z, floor).unwrap();
@@ -1708,28 +1829,7 @@ mod tests {
                 lid_openers: &lid_openers,
                 mod_effects: None,
             };
-            let kind = std::sync::Arc::new(types.types["minecraft:pig"].clone());
-            let mut m = Mob::new(1, kind, Vec3::new(0.5, 1.0, 0.5), 0.0);
-            // Falling faster than gravity, so the landing is hard enough.
-            m.velocity = Vec3::new(0.0, -1.0, 0.0);
-            m.do_move(&w, &mut Vec::new());
-            assert!(
-                m.vertical_collision_below,
-                "{ground}: the pig lands on the block"
-            );
-            if bounces {
-                assert!(
-                    m.velocity.y > 0.0,
-                    "{ground}: restitution sends the pig back up, got {}",
-                    m.velocity.y
-                );
-            } else {
-                assert!(
-                    m.velocity.y <= 0.0,
-                    "{ground}: no bounce, got {}",
-                    m.velocity.y
-                );
-            }
+            visit(&w, &types, floor);
         }
     }
 }

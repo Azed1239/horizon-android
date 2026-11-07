@@ -288,7 +288,16 @@ impl MotionWorld<'_, '_, '_> {
     /// vehicle fell `distance` blocks at `multiplier`, so the player takes
     /// `Player.causeFallDamage` of it.
     pub fn cause_mount_fall(&mut self, distance: f64, multiplier: f32) -> Result<bool> {
-        BlockLandingWorld::cause_fall_damage(self, distance, multiplier, LandingDamage::Fall)
+        self.cause_mount_fall_with_source(distance, multiplier, LandingDamage::Fall)
+    }
+    /// A vehicle propagates its original damage source to the passenger.
+    pub fn cause_mount_fall_with_source(
+        &mut self,
+        distance: f64,
+        multiplier: f32,
+        source: LandingDamage,
+    ) -> Result<bool> {
+        BlockLandingWorld::cause_fall_damage(self, distance, multiplier, source)
     }
 }
 impl FallDamageWorld for MotionWorld<'_, '_, '_> {

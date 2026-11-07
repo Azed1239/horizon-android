@@ -7,7 +7,7 @@ use horizon_client::{
     blocks::Fluid,
     hud::HudBatch,
     items::ItemStack,
-    mobs::{MobEvent, Species, Who, equine},
+    mobs::{DamageKind, MobEvent, Species, Who, equine},
     motion::{MotionWorld, PlayerMotion},
     pose::{Dimensions, Pose},
     sprint::Keys,
@@ -574,9 +574,15 @@ impl Game<'_> {
     /// `causeFallDamage` of its fall, as the mount's own damage does. The local
     /// player, the server players and the mob on its back each get it, with
     /// their own safe distance and armour.
-    pub(super) fn fall_to_passengers(&mut self, mob: u32, distance: f64, modifier: f32) {
+    pub(super) fn fall_to_passengers(
+        &mut self,
+        mob: u32,
+        distance: f64,
+        modifier: f32,
+        source: DamageKind,
+    ) {
         if self.riding == Some(mob) {
-            self.rider_fall_damage(distance, modifier);
+            self.rider_fall_damage(distance, modifier, source);
         }
         let guests: Vec<u32> = self.lan.as_ref().map_or_else(Vec::new, |h| {
             h.hub
@@ -590,7 +596,9 @@ impl Game<'_> {
             && let Some(mut host) = self.lan.take()
         {
             for conn in guests {
-                self.guest_hit_by(&mut host, conn, |g| g.rider_fall_damage(distance, modifier));
+                self.guest_hit_by(&mut host, conn, |g| {
+                    g.rider_fall_damage(distance, modifier, source)
+                });
             }
             self.lan = Some(host);
         }
@@ -603,7 +611,7 @@ impl Game<'_> {
             && let Some(r) = self.mobs.iter_mut().find(|m| m.id == rider)
         {
             let mut events = Vec::new();
-            r.cause_fall_damage_from(distance, modifier, &mut events);
+            r.cause_fall_damage_from(distance, modifier, source, &mut events);
             let _ = self.handle_mob_events(events);
         }
     }
@@ -612,7 +620,12 @@ impl Game<'_> {
     /// landing code's own fall damage for the player: creative flight is
     /// exempt, and the statistic, the sounds and the damage records wait in the
     /// player's events for its next tick, as a landing of its own leaves them.
-    fn rider_fall_damage(&mut self, distance: f64, modifier: f32) {
+    fn rider_fall_damage(&mut self, distance: f64, modifier: f32, source: DamageKind) {
+        use horizon_world::block_landing::LandingDamage;
+        let source = match source {
+            DamageKind::Stalagmite => LandingDamage::Stalagmite,
+            _ => LandingDamage::Fall,
+        };
         let Some(player) = self.player.as_mut() else {
             return;
         };
@@ -624,7 +637,7 @@ impl Game<'_> {
             collision_binding: self.collision,
             resources: self.motion,
         }
-        .cause_mount_fall(distance, modifier);
+        .cause_mount_fall_with_source(distance, modifier, source);
     }
     /// `PlayerRideableJumping`: horses, camels and nautili (the dash).
     fn jumps(species: Species) -> bool {
