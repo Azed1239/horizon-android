@@ -1687,7 +1687,11 @@ impl Game<'_> {
         self.lan_update_tag_sources(&mut encoder);
         let far = (net.lod_distance > 0)
             .then(|| horizon_client::lod_net::Service::new(net.lod_distance, biome_names.clone()));
-        let lan = Lan::start_with(sync.clone(), net)?;
+        let lan = Lan::start_with_configuration_tasks(
+            sync.clone(),
+            net,
+            mod_api::__private::listened(mod_api::HookId::RegisterConfigurationTasks),
+        )?;
         let mut hub = Hub::new(lan, sync, encoder, config, self.loop_context.clone());
         self.bind_guest_residency(&mut hub);
         hub.rule_registry = self.level.rule_registry.clone();
@@ -2900,6 +2904,30 @@ impl Game<'_> {
         let Some(mut host) = self.lan.take() else {
             return;
         };
+        if self.level_pass.first {
+            // Give hooks the normal server host while the joining profile is
+            // still confined to the connection thread.
+            let requests: Vec<_> = host.hub.lan.configuration_requests().collect();
+            if !requests.is_empty() {
+                self.lan = Some(host);
+                for request in requests {
+                    if Instant::now() < request.deadline {
+                        let mut tasks = Vec::new();
+                        self.native_register_configuration_tasks(
+                            request.player,
+                            &request.name,
+                            &request.brand,
+                            &mut tasks,
+                        );
+                        let _ = request.reply.send(tasks);
+                    }
+                }
+                let Some(back) = self.lan.take() else {
+                    return;
+                };
+                host = back;
+            }
+        }
         let holding = lan::Holding::start();
         // Last tick's tracked entities: enough for place collision and joins
         // before this tick moves anyone.
